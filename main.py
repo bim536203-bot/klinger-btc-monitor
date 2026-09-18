@@ -33,6 +33,7 @@ state = {
     "price": None,
     "last_closed_bar": None,
     "last_error": None,
+    "telegram_test": "pending",
 }
 
 task = None
@@ -134,7 +135,18 @@ async def telegram_safe(text):
     try:
         await telegram(text)
     except Exception as exc:
-        state["last_error"] = f"Telegram: {exc}"
+        state["last_error"] = f"Telegram: {type(exc).__name__}"
+
+
+async def telegram_deploy_test():
+    try:
+        await telegram(
+            "✅ Teste concluído: o monitor Klinger BTC está conectado ao Telegram."
+        )
+        state["telegram_test"] = "sent"
+    except Exception as exc:
+        state["telegram_test"] = "failed"
+        state["last_error"] = f"Telegram: {type(exc).__name__}"
 
 
 async def seed():
@@ -296,6 +308,7 @@ def ensure_monitor():
 async def startup_event():
     # Inicia automaticamente após cada deploy ou despertar da instância.
     ensure_monitor()
+    asyncio.create_task(telegram_deploy_test())
 
 
 @app.get("/")
