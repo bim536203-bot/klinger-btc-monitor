@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -34,10 +35,13 @@ state = {
     "last_closed_bar": None,
     "last_error": None,
     "telegram_status": "checking",
+    "telegram_test": "not_sent",
 }
 
 task = None
 bars = []
+telegram_test_used = False
+TELEGRAM_TEST_TOKEN_HASH = "ea974d4087affd353d7d761a7c55e3e664a9230e8e9219558bbb1907942bc7c8"
 
 
 def ema(values, length):
@@ -352,6 +356,47 @@ async def start():
 async def stop():
     state["running"] = False
     return state
+
+
+@app.post("/test-telegram")
+async def test_telegram(request: Request):
+    global telegram_test_used
+    supplied = request.headers.get("X-Test-Token", "")
+    supplied_hash = hashlib.sha256(supplied.encode()).hexdigest()
+    if telegram_test_used or not hmac.compare_digest(
+        supplied_hash, TELEGRAM_TEST_TOKEN_HASH
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    telegram_test_used = True
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat = os.getenv("TELEGRAM_CHAT_ID", "")
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={
+                "chat_id": chat,
+                "text": (
+                    "🧪 TESTE — NÃO É SINAL REAL\n\n"
+                    "🟢 COMPRA CONFIRMADA — BTCUSDT 1m\n"
+                    "Preço de exemplo: 78.000,00\n"
+                    "Regra: cruzamento do Klinger + próxima vela da mesma cor."
+                ),
+            },
+        )
+    if response.status_code != 200:
+        try:
+            description = response.json().get("description", "unknown")
+        except Exception:
+            description = "unknown"
+        state["telegram_test"] = "failed"
+        state["telegram_test_detail"] = {
+            "status": response.status_code,
+            "description": description,
+        }
+        raise HTTPException(status_code=502, detail="Telegram failed")
+    state["telegram_test"] = "sent"
+    return {"ok": True}
 
 
 @app.post("/tradingview")
