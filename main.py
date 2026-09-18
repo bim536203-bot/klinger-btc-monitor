@@ -1,13 +1,13 @@
-import os, asyncio, time, json
+import os, asyncio, time, json, hmac
 from collections import deque
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx, websockets
 
 app=FastAPI(title='Klinger BTC Server')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 FAST,SLOW,SIG=34,55,13
-state={'running':False,'end_at':0,'last_signal':None,'kvo':None,'signal':None,'price':None,'last_error':None}
+state={'running':False,'end_at':0,'last_signal':None,'last_webhook':None,'kvo':None,'signal':None,'price':None,'last_error':None}
 task=None
 bars=[]
 
@@ -48,7 +48,13 @@ async def telegram(text):
     token=os.getenv('TELEGRAM_BOT_TOKEN'); chat=os.getenv('TELEGRAM_CHAT_ID')
     if not token or not chat:return
     async with httpx.AsyncClient(timeout=10) as c:
-        await c.post(f'https://api.telegram.org/bot{token}/sendMessage',data={'chat_id':chat,'text':text})
+        r=await c.post(f'https://api.telegram.org/bot{token}/sendMessage',data={'chat_id':chat,'text':text})
+        r.raise_for_status()
+async def telegram_safe(text):
+    try:
+        await telegram(text)
+    except Exception as e:
+        state['last_error']=f'Telegram: {e}'
 
 async def seed():
     global bars
@@ -104,3 +110,28 @@ async def start():
 async def stop():
     state['running']=False
     return state
+@app.post('/tradingview')
+async def tradingview(request: Request):
+    expected=os.getenv('TRADINGVIEW_WEBHOOK_SECRET')
+    if not expected:
+        raise HTTPException(status_code=503,detail='Webhook secret not configured')
+    try:
+        payload=await request.json()
+    except Exception:
+        raise HTTPException(status_code=400,detail='Invalid JSON')
+    supplied=str(payload.get('secret',''))
+    if not hmac.compare_digest(supplied,expected):
+        raise HTTPException(status_code=401,detail='Invalid secret')
+    signal_name=str(payload.get('signal','')).strip().upper()
+    if signal_name not in ('COMPRA','VENDA'):
+        raise HTTPException(status_code=400,detail='Invalid signal')
+    ticker=str(payload.get('ticker','BTCUSDT'))
+    interval=str(payload.get('interval','1'))
+    price=payload.get('price')
+    event_time=payload.get('time',int(time.time()*1000))
+    event={'type':signal_name,'ticker':ticker,'interval':interval,'price':price,'time':event_time,'received_at':int(time.time())}
+    state['last_webhook']=event
+    state['last_signal']=event
+    message=f'🔔 TradingView — {signal_name}\nAtivo: {ticker}\nTempo: {interval}\nPreço: {price}'
+    asyncio.create_task(telegram_safe(message))
+    return {'ok':True,'signal':signal_name}

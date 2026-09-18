@@ -1,0 +1,52 @@
+//@version=6
+import TradingView/ta/12 as tvta
+
+indicator("Klinger confirmado → Webhook", shorttitle="KVO Webhook", overlay=false)
+
+fastLen = input.int(34, "KVO rápido", minval=1)
+slowLen = input.int(55, "KVO lento", minval=2)
+signalLen = input.int(13, "Linha de sinal", minval=1)
+webhookSecret = input.string("", "Segredo do webhook (letras e números)")
+
+[kvo, signalLine] = tvta.kvo(fastLen, slowLen, signalLen)
+
+plot(kvo, "KVO", color=color.blue, linewidth=2)
+plot(signalLine, "Sinal", color=color.green, linewidth=2)
+hline(0, "Zero", color=color.gray)
+
+candleColor = close > open ? 1 : close < open ? -1 : 0
+crossUp = ta.crossover(kvo, signalLine)
+crossDown = ta.crossunder(kvo, signalLine)
+
+var int pendingDirection = 0
+var int pendingColor = 0
+var int pendingBar = na
+
+bool confirmedBuy = false
+bool confirmedSell = false
+
+if barstate.isconfirmed
+    if pendingDirection != 0 and bar_index == pendingBar + 1
+        confirmedBuy := pendingDirection == 1 and pendingColor == 1 and candleColor == 1
+        confirmedSell := pendingDirection == -1 and pendingColor == -1 and candleColor == -1
+
+        if confirmedBuy or confirmedSell
+            side = confirmedBuy ? "COMPRA" : "VENDA"
+            message = '{"secret":"' + webhookSecret + '","signal":"' + side + '","ticker":"' + syminfo.tickerid + '","interval":"' + timeframe.period + '","price":' + str.tostring(close) + ',"time":' + str.tostring(time) + '}'
+            alert(message, alert.freq_once_per_bar_close)
+
+        pendingDirection := 0
+        pendingColor := 0
+        pendingBar := na
+
+    if crossUp
+        pendingDirection := 1
+        pendingColor := candleColor
+        pendingBar := bar_index
+    else if crossDown
+        pendingDirection := -1
+        pendingColor := candleColor
+        pendingBar := bar_index
+
+plotshape(confirmedBuy, title="Compra confirmada", style=shape.labelup, text="COMPRA", color=color.lime, textcolor=color.black, location=location.bottom)
+plotshape(confirmedSell, title="Venda confirmada", style=shape.labeldown, text="VENDA", color=color.red, textcolor=color.white, location=location.top)
