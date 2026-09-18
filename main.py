@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -34,10 +35,13 @@ state = {
     "last_closed_bar": None,
     "last_error": None,
     "telegram_status": "checking",
+    "telegram_test": "not_sent",
 }
 
 task = None
 bars = []
+telegram_test_used = False
+TELEGRAM_TEST_TOKEN_HASH = "5b58b6730cfab0b19ba0155c7cee0c3d3493269284afbca0cb0ffa028e78c078"
 
 
 def ema(values, length):
@@ -352,6 +356,32 @@ async def start():
 async def stop():
     state["running"] = False
     return state
+
+
+@app.post("/test-telegram")
+async def test_telegram(request: Request):
+    global telegram_test_used
+    supplied = request.headers.get("X-Test-Token", "")
+    supplied_hash = hashlib.sha256(supplied.encode()).hexdigest()
+    if telegram_test_used or not hmac.compare_digest(
+        supplied_hash, TELEGRAM_TEST_TOKEN_HASH
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    telegram_test_used = True
+    try:
+        await telegram(
+            "🧪 TESTE — NÃO É SINAL REAL\n\n"
+            "🟢 COMPRA CONFIRMADA — BTCUSDT 1m\n"
+            "Preço de exemplo: 78.000,00\n"
+            "Regra: cruzamento do Klinger + próxima vela da mesma cor."
+        )
+        state["telegram_test"] = "sent"
+        return {"ok": True}
+    except Exception as exc:
+        state["telegram_test"] = "failed"
+        state["last_error"] = f"Telegram: {type(exc).__name__}"
+        raise HTTPException(status_code=502, detail="Telegram failed") from exc
 
 
 @app.post("/tradingview")
