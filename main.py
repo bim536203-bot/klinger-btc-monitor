@@ -53,14 +53,14 @@ async def telegram(text):
 async def seed():
     global bars
     async with httpx.AsyncClient(timeout=15) as c:
-        r=await c.get('https://api.binance.com/api/v3/klines',params={'symbol':'BTCUSDT','interval':'1m','limit':1000});r.raise_for_status()
+        r=await c.get('https://data-api.binance.vision/api/v3/klines',params={'symbol':'BTCUSDT','interval':'1m','limit':1000});r.raise_for_status()
     bars=[{'t':int(x[0]),'o':float(x[1]),'h':float(x[2]),'l':float(x[3]),'c':float(x[4]),'v':float(x[5]),'closed':True} for x in r.json()]
 
 async def monitor():
     global bars
     try:
         await seed(); last_signal_bar=None; pending=None
-        async with websockets.connect('wss://stream.binance.com:9443/ws/btcusdt@kline_1m',ping_interval=20,ping_timeout=20) as ws:
+        async with websockets.connect('wss://data-stream.binance.vision/ws/btcusdt@kline_1m',ping_interval=20,ping_timeout=20) as ws:
             while state['running'] and time.time()<state['end_at']:
                 raw=await asyncio.wait_for(ws.recv(),timeout=30); m=json.loads(raw); q=m['k']
                 b={'t':int(q['t']),'o':float(q['o']),'h':float(q['h']),'l':float(q['l']),'c':float(q['c']),'v':float(q['v']),'closed':bool(q['x'])}
