@@ -33,7 +33,7 @@ state = {
     "price": None,
     "last_closed_bar": None,
     "last_error": None,
-    "telegram_test": "pending",
+    "telegram_status": "checking",
 }
 
 task = None
@@ -138,15 +138,30 @@ async def telegram_safe(text):
         state["last_error"] = f"Telegram: {type(exc).__name__}"
 
 
-async def telegram_deploy_test():
-    try:
-        await telegram(
-            "✅ Teste concluído: o monitor Klinger BTC está conectado ao Telegram."
+async def telegram_diagnostics():
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat:
+        state["telegram_status"] = "missing_environment_variable"
+        return
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        token_check = await client.get(
+            f"https://api.telegram.org/bot{token}/getMe"
         )
-        state["telegram_test"] = "sent"
-    except Exception as exc:
-        state["telegram_test"] = "failed"
-        state["last_error"] = f"Telegram: {type(exc).__name__}"
+        if token_check.status_code != 200:
+            state["telegram_status"] = "invalid_token"
+            return
+
+        chat_check = await client.get(
+            f"https://api.telegram.org/bot{token}/getChat",
+            params={"chat_id": chat},
+        )
+        if chat_check.status_code != 200:
+            state["telegram_status"] = "invalid_chat_or_bot_not_started"
+            return
+
+    state["telegram_status"] = "ready"
 
 
 async def seed():
@@ -308,7 +323,7 @@ def ensure_monitor():
 async def startup_event():
     # Inicia automaticamente após cada deploy ou despertar da instância.
     ensure_monitor()
-    asyncio.create_task(telegram_deploy_test())
+    asyncio.create_task(telegram_diagnostics())
 
 
 @app.get("/")
