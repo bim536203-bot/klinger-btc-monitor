@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 import hmac
 import json
+import math
 import os
 import time
+from urllib.parse import urlencode
 
 import httpx
 import websockets
@@ -30,6 +33,12 @@ MIN_POST_CROSS = 10.0
 MAX_POST_CROSS = 14.0
 REST_URL = "https://data-api.binance.vision/api/v3/klines"
 WS_URL = "wss://data-stream.binance.vision/ws/btcusdt@kline_1m"
+FUTURES_TESTNET_URL = "https://demo-fapi.binance.com"
+TRADE_SYMBOL = "BTCUSDT"
+TRADE_LEVERAGE = 10
+TARGET_NOTIONAL_USDT = 50.0
+MAX_CONSECUTIVE_LOSSES = 5
+QUANTITY_STEP = 0.0001
 
 state = {
     "running": False,
@@ -48,10 +57,231 @@ state = {
     "loss_count": 0,
     "total_count": 0,
     "accuracy": 0.0,
+    "trading_environment": "binance_futures_testnet",
+    "trading_enabled": False,
+    "trading_status": "disabled",
+    "trade_leverage": TRADE_LEVERAGE,
+    "target_notional_usdt": TARGET_NOTIONAL_USDT,
+    "estimated_margin_usdt": TARGET_NOTIONAL_USDT / TRADE_LEVERAGE,
+    "open_position": None,
+    "last_order": None,
+    "last_trade_result": None,
+    "consecutive_losses": 0,
+    "max_consecutive_losses": MAX_CONSECUTIVE_LOSSES,
+    "trading_error": None,
 }
 
 task = None
 bars = []
+
+
+def env_true(name):
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def futures_credentials():
+    return (
+        os.getenv("BINANCE_TESTNET_API_KEY", "").strip(),
+        os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip(),
+    )
+
+
+def order_quantity(price):
+    """Arredonda para cima para respeitar notional minimo e step do BTCUSDT."""
+    steps = math.ceil((TARGET_NOTIONAL_USDT / price) / QUANTITY_STEP)
+    return round(steps * QUANTITY_STEP, 4)
+
+
+async def futures_request(method, path, params=None, signed=False):
+    params = dict(params or {})
+    api_key, secret = futures_credentials()
+    headers = {}
+    if signed:
+        if not api_key or not secret:
+            raise RuntimeError("Binance Testnet credentials are not configured")
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 5000
+        query = urlencode(params)
+        params["signature"] = hmac.new(
+            secret.encode(), query.encode(), hashlib.sha256
+        ).hexdigest()
+        headers["X-MBX-APIKEY"] = api_key
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.request(
+            method,
+            f"{FUTURES_TESTNET_URL}{path}",
+            params=params,
+            headers=headers,
+        )
+    if response.status_code >= 400:
+        try:
+            error = response.json()
+            message = error.get("msg", "Binance API error")
+            code = error.get("code", response.status_code)
+        except Exception:
+            message = "Binance API error"
+            code = response.status_code
+        raise RuntimeError(f"Binance {code}: {message}")
+    return response.json()
+
+
+async def trading_diagnostics():
+    state["trading_enabled"] = env_true("BINANCE_TRADING_ENABLED")
+    api_key, secret = futures_credentials()
+    if not state["trading_enabled"]:
+        state["trading_status"] = "disabled"
+        return
+    if not api_key or not secret:
+        state["trading_status"] = "missing_testnet_credentials"
+        state["trading_enabled"] = False
+        return
+    try:
+        await futures_request("GET", "/fapi/v2/account", signed=True)
+        positions = await futures_request(
+            "GET",
+            "/fapi/v3/positionRisk",
+            {"symbol": TRADE_SYMBOL},
+            signed=True,
+        )
+        if any(float(position.get("positionAmt", 0)) != 0 for position in positions):
+            state["trading_status"] = "blocked_existing_position"
+            state["trading_error"] = (
+                "Existing Testnet position detected; close it before enabling the bot"
+            )
+            state["trading_enabled"] = False
+            return
+        try:
+            await futures_request(
+                "POST",
+                "/fapi/v1/marginType",
+                {"symbol": TRADE_SYMBOL, "marginType": "ISOLATED"},
+                signed=True,
+            )
+        except RuntimeError as exc:
+            if "-4046" not in str(exc):
+                raise
+        await futures_request(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": TRADE_SYMBOL, "leverage": TRADE_LEVERAGE},
+            signed=True,
+        )
+        state["trading_status"] = "ready"
+        state["trading_error"] = None
+    except Exception as exc:
+        state["trading_status"] = "error"
+        state["trading_error"] = str(exc)
+        state["trading_enabled"] = False
+
+
+async def open_testnet_position(signal_type, candle, seconds_remaining):
+    if not state["trading_enabled"] or state["trading_status"] != "ready":
+        return None
+    if state["open_position"] is not None:
+        return None
+    side = "BUY" if signal_type == "COMPRA" else "SELL"
+    quantity = order_quantity(candle["c"])
+    response = await futures_request(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": TRADE_SYMBOL,
+            "side": side,
+            "type": "MARKET",
+            "quantity": f"{quantity:.4f}",
+            "newOrderRespType": "RESULT",
+        },
+        signed=True,
+    )
+    entry_price = float(response.get("avgPrice") or candle["c"])
+    position = {
+        "signal_type": signal_type,
+        "side": side,
+        "quantity": quantity,
+        "entry_price": entry_price,
+        "signal_bar": candle["t"],
+        "opened_at": int(time.time()),
+        "seconds_remaining": round(seconds_remaining, 1),
+        "order_id": response.get("orderId"),
+    }
+    state["open_position"] = position
+    state["last_order"] = {
+        "action": "OPEN",
+        "side": side,
+        "quantity": quantity,
+        "price": entry_price,
+        "order_id": response.get("orderId"),
+    }
+    await telegram_safe(
+        f"🧪 TESTNET — POSIÇÃO ABERTA\n"
+        f"{signal_type} | BTCUSDT Futures {TRADE_LEVERAGE}x isolado\n"
+        f"Quantidade: {quantity:.4f} BTC | Entrada: {entry_price:.2f}"
+    )
+    return position
+
+
+async def close_testnet_position(candle):
+    position = state["open_position"]
+    if not position:
+        return None
+    close_side = "SELL" if position["side"] == "BUY" else "BUY"
+    response = await futures_request(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": TRADE_SYMBOL,
+            "side": close_side,
+            "type": "MARKET",
+            "quantity": f"{position['quantity']:.4f}",
+            "reduceOnly": "true",
+            "newOrderRespType": "RESULT",
+        },
+        signed=True,
+    )
+    exit_price = float(response.get("avgPrice") or candle["c"])
+    direction = 1.0 if position["side"] == "BUY" else -1.0
+    gross_pnl = (
+        (exit_price - position["entry_price"])
+        * position["quantity"]
+        * direction
+    )
+    won = gross_pnl > 0
+    if won:
+        state["consecutive_losses"] = 0
+    else:
+        state["consecutive_losses"] += 1
+    result = {
+        "result": "LUCRO" if won else "LOS",
+        "gross_pnl_usdt": round(gross_pnl, 6),
+        "entry_price": position["entry_price"],
+        "exit_price": exit_price,
+        "quantity": position["quantity"],
+        "closed_at": int(time.time()),
+        "order_id": response.get("orderId"),
+    }
+    state["last_trade_result"] = result
+    state["last_order"] = {
+        "action": "CLOSE",
+        "side": close_side,
+        "quantity": position["quantity"],
+        "price": exit_price,
+        "order_id": response.get("orderId"),
+    }
+    state["open_position"] = None
+    if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+        state["trading_enabled"] = False
+        state["trading_status"] = "paused_loss_limit"
+    elif state["trading_enabled"]:
+        state["trading_status"] = "ready"
+        state["trading_error"] = None
+    await telegram_safe(
+        f"🧪 TESTNET — {result['result']}\n"
+        f"Entrada: {position['entry_price']:.2f} | Saída: {exit_price:.2f}\n"
+        f"Resultado bruto: {gross_pnl:+.6f} USDT\n"
+        f"Perdas consecutivas: "
+        f"{state['consecutive_losses']}/{MAX_CONSECUTIVE_LOSSES}"
+    )
+    return result
 
 
 def ema(values, length):
@@ -290,6 +520,17 @@ async def monitor():
                             f"BTCUSDT 1m | Preço: {candle['c']:.2f}\n"
                             f"Sinal detectado nos {SECONDS_BEFORE_CLOSE}s finais da vela."
                         )
+                        try:
+                            await open_testnet_position(
+                                latched_signal, candle, seconds_remaining
+                            )
+                        except Exception as exc:
+                            state["trading_error"] = str(exc)
+                            state["trading_status"] = "error"
+                            state["trading_enabled"] = False
+                            await telegram_safe(
+                                f"⚠️ TESTNET pausado: {type(exc).__name__}"
+                            )
 
                     if not bool(kline["x"]) or candle["t"] == last_processed_bar:
                         continue
@@ -298,6 +539,22 @@ async def monitor():
                     bars.append(candle)
                     bars = bars[-1000:]
                     state["last_closed_bar"] = candle["t"]
+
+                    # Tenta fechar novamente em fechamentos posteriores caso a
+                    # primeira tentativa falhe por um erro temporario da API.
+                    if (
+                        state["open_position"]
+                        and candle["t"] > state["open_position"]["signal_bar"]
+                    ):
+                        try:
+                            await close_testnet_position(candle)
+                        except Exception as exc:
+                            state["trading_error"] = str(exc)
+                            state["trading_status"] = "close_retry_pending"
+                            await telegram_safe(
+                                "⚠️ Falha ao fechar posição TESTNET; "
+                                "nova tentativa no próximo fechamento."
+                            )
 
                     # A vela seguinte classifica LUCRO/LOS, como no Pine.
                     if pending and candle["t"] > pending["bar"]:
@@ -340,6 +597,7 @@ async def startup_event():
     # Inicia automaticamente após cada deploy ou despertar da instância.
     ensure_monitor()
     asyncio.create_task(telegram_diagnostics())
+    asyncio.create_task(trading_diagnostics())
 
 
 @app.get("/")
@@ -355,6 +613,24 @@ def root():
 @app.get("/status")
 def status():
     return state
+
+
+@app.get("/trading-status")
+def trading_status():
+    return {
+        "environment": state["trading_environment"],
+        "enabled": state["trading_enabled"],
+        "status": state["trading_status"],
+        "leverage": state["trade_leverage"],
+        "target_notional_usdt": state["target_notional_usdt"],
+        "estimated_margin_usdt": state["estimated_margin_usdt"],
+        "open_position": state["open_position"],
+        "last_order": state["last_order"],
+        "last_trade_result": state["last_trade_result"],
+        "consecutive_losses": state["consecutive_losses"],
+        "max_consecutive_losses": state["max_consecutive_losses"],
+        "error": state["trading_error"],
+    }
 
 
 @app.post("/start")
