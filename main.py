@@ -238,6 +238,15 @@ async def dashboard_snapshot():
             "signal_history": list(state["signal_history"][:100]),
             "error": None,
         }
+        # No modo manual, o painel depende apenas do monitor e do Telegram.
+        # Não consulta a conta Futures Demo nem envia requisições assinadas.
+        if not state["trading_enabled"]:
+            base["connected"] = state["running"]
+            base["error"] = state["last_error"]
+            dashboard_cache["updated_monotonic"] = time.monotonic()
+            dashboard_cache["data"] = base
+            return base
+
         if not api_key or not secret:
             base["error"] = "Chaves do Binance Demo ainda nao configuradas"
         else:
