@@ -580,7 +580,12 @@ async def telegram(text):
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat, "text": text},
+            data={
+                "chat_id": chat,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_notification": "false",
+            },
         )
         response.raise_for_status()
 
@@ -711,21 +716,15 @@ async def monitor():
                         state["pending"] = pending
                         icon = "🟢" if latched_signal == "COMPRA" else "🔴"
                         await telegram_safe(
-                            f"{icon} Klinger V4 — {latched_signal}\n"
-                            f"BTCUSDT 1m | Preço: {candle['c']:.2f}\n"
-                            f"Sinal detectado nos {SECONDS_BEFORE_CLOSE}s finais da vela."
+                            f"🚨🚨 <b>ALERTA DE OPERAÇÃO — {latched_signal}</b> 🚨🚨\n\n"
+                            f"{icon} <b>BTCUSDT • 1 minuto</b>\n"
+                            f"💰 Preço: <b>{candle['c']:.2f}</b>\n"
+                            f"⏱️ Sinal confirmado nos {SECONDS_BEFORE_CLOSE}s finais da vela.\n\n"
+                            f"👉 <b>Confira o gráfico agora.</b>\n"
+                            f"⚠️ Operação manual: nenhuma ordem foi enviada."
                         )
-                        try:
-                            await open_testnet_position(
-                                latched_signal, candle, seconds_remaining
-                            )
-                        except Exception as exc:
-                            state["trading_error"] = str(exc)
-                            state["trading_status"] = "error"
-                            state["trading_enabled"] = False
-                            await telegram_safe(
-                                f"⚠️ TESTNET pausado: {type(exc).__name__}"
-                            )
+                        # Modo somente alerta: nenhuma ordem, inclusive Demo/Testnet,
+                        # e enviada automaticamente quando surge um sinal.
 
                     if not bool(kline["x"]) or candle["t"] == last_processed_bar:
                         continue
@@ -1532,7 +1531,12 @@ async def telegram(text):
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat, "text": text},
+            data={
+                "chat_id": chat,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_notification": "false",
+            },
         )
         response.raise_for_status()
 
@@ -1663,21 +1667,15 @@ async def monitor():
                         state["pending"] = pending
                         icon = "🟢" if latched_signal == "COMPRA" else "🔴"
                         await telegram_safe(
-                            f"{icon} Klinger V4 — {latched_signal}\n"
-                            f"BTCUSDT 1m | Preço: {candle['c']:.2f}\n"
-                            f"Sinal detectado nos {SECONDS_BEFORE_CLOSE}s finais da vela."
+                            f"🚨🚨 <b>ALERTA DE OPERAÇÃO — {latched_signal}</b> 🚨🚨\n\n"
+                            f"{icon} <b>BTCUSDT • 1 minuto</b>\n"
+                            f"💰 Preço: <b>{candle['c']:.2f}</b>\n"
+                            f"⏱️ Sinal confirmado nos {SECONDS_BEFORE_CLOSE}s finais da vela.\n\n"
+                            f"👉 <b>Confira o gráfico agora.</b>\n"
+                            f"⚠️ Operação manual: nenhuma ordem foi enviada."
                         )
-                        try:
-                            await open_testnet_position(
-                                latched_signal, candle, seconds_remaining
-                            )
-                        except Exception as exc:
-                            state["trading_error"] = str(exc)
-                            state["trading_status"] = "error"
-                            state["trading_enabled"] = False
-                            await telegram_safe(
-                                f"⚠️ TESTNET pausado: {type(exc).__name__}"
-                            )
+                        # Modo somente alerta: nenhuma ordem, inclusive Demo/Testnet,
+                        # e enviada automaticamente quando surge um sinal.
 
                     if not bool(kline["x"]) or candle["t"] == last_processed_bar:
                         continue
