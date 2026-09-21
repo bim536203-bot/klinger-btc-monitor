@@ -19,12 +19,22 @@ app.add_middleware(
 )
 
 FAST, SLOW, SIG = 34, 55, 13
+SECONDS_BEFORE_CLOSE = 30
+MODE = "Cruzamento filtrado"
+MAX_BODY_HIGH_PRECISION = 59.0
+EXHAUSTION_BODY_MIN = 83.0
+EXHAUSTION_BODY_MAX = 99.9
+MAX_KVO_STRETCH = 51.7
+USE_MODERATE_CROSS = True
+MIN_POST_CROSS = 10.0
+MAX_POST_CROSS = 14.0
 REST_URL = "https://data-api.binance.vision/api/v3/klines"
 WS_URL = "wss://data-stream.binance.vision/ws/btcusdt@kline_1m"
 
 state = {
     "running": False,
-    "mode": "binance_direct",
+    "mode": MODE,
+    "indicator": "Klinger Fabio V4 - Alta Precisao",
     "last_signal": None,
     "last_webhook": None,
     "pending": None,
@@ -34,6 +44,10 @@ state = {
     "last_closed_bar": None,
     "last_error": None,
     "telegram_status": "checking",
+    "profit_count": 0,
+    "loss_count": 0,
+    "total_count": 0,
+    "accuracy": 0.0,
 }
 
 task = None
@@ -41,73 +55,88 @@ bars = []
 
 
 def ema(values, length):
-    out = [None] * len(values)
-    if len(values) < length:
-        return out
-    value = sum(values[:length]) / length
-    out[length - 1] = value
+    """Equivalente ao ta.ema do Pine: inicia no primeiro valor nao-na."""
+    out = []
+    value = None
     alpha = 2 / (length + 1)
-    for i in range(length, len(values)):
-        value = alpha * values[i] + (1 - alpha) * value
-        out[i] = value
+    for source in values:
+        if source is None:
+            out.append(None)
+            continue
+        value = source if value is None else alpha * source + (1 - alpha) * value
+        out.append(value)
     return out
 
 
 def klinger_full(candles):
-    """Klinger clássico usado pela regra 34/55/13."""
-    if len(candles) < 100:
+    """Replica TradingView/ta/12 kvo(fastLen, slowLen, trigLen)."""
+    if len(candles) < 2:
+        return None
+    trend_volume = [None]
+    previous_hlc3 = (
+        candles[0]["h"] + candles[0]["l"] + candles[0]["c"]
+    ) / 3.0
+    for candle in candles[1:]:
+        hlc3 = (candle["h"] + candle["l"] + candle["c"]) / 3.0
+        change = hlc3 - previous_hlc3
+        direction = 1.0 if change > 0 else -1.0 if change < 0 else 0.0
+        trend_volume.append(direction * candle["v"] * 100.0)
+        previous_hlc3 = hlc3
+
+    fast_ema = ema(trend_volume, FAST)
+    slow_ema = ema(trend_volume, SLOW)
+    kvo = [
+        None if fast is None or slow is None else fast - slow
+        for fast, slow in zip(fast_ema, slow_ema)
+    ]
+    return kvo, ema(kvo, SIG)
+
+
+def evaluate_v4(candles):
+    """Aplica literalmente os filtros padrao do Pine Klinger Fabio V4."""
+    calculated = klinger_full(candles)
+    if not calculated or len(candles) < 3:
+        return None
+    kvo, signal = calculated
+    current = len(candles) - 1
+    previous = current - 1
+    values = (kvo[previous], signal[previous], kvo[current], signal[current])
+    if any(value is None for value in values):
         return None
 
-    volume_force = []
-    previous_trend = 1
-    previous_dm = 0.0
-    previous_cm = 0.0
-    previous_hlc = None
+    candle = candles[current]
+    candle_range = max(candle["h"] - candle["l"], 1e-12)
+    body_percent = abs(candle["c"] - candle["o"]) / candle_range * 100.0
+    buy_cross = kvo[previous] <= signal[previous] and kvo[current] > signal[current]
+    sell_cross = kvo[previous] >= signal[previous] and kvo[current] < signal[current]
+    buy_stretch_blocked = kvo[current] > MAX_KVO_STRETCH
+    sell_stretch_blocked = kvo[current] < -MAX_KVO_STRETCH
+    exhaustion_blocked = EXHAUSTION_BODY_MIN < body_percent <= EXHAUSTION_BODY_MAX
+    high_precision_body = body_percent <= MAX_BODY_HIGH_PRECISION
 
-    for candle in candles:
-        hlc = candle["h"] + candle["l"] + candle["c"]
-        dm = candle["h"] - candle["l"]
-        if previous_hlc is None:
-            trend = 1
-        elif hlc > previous_hlc:
-            trend = 1
-        elif hlc < previous_hlc:
-            trend = -1
-        else:
-            trend = previous_trend
+    if MODE == "Alta precisao":
+        buy_mode = high_precision_body and not buy_stretch_blocked
+        sell_mode = high_precision_body and not sell_stretch_blocked
+    elif MODE == "Equilibrado":
+        buy_mode = not buy_stretch_blocked and not exhaustion_blocked
+        sell_mode = not sell_stretch_blocked and not exhaustion_blocked
+    else:
+        buy_mode = not buy_stretch_blocked
+        sell_mode = not sell_stretch_blocked
 
-        cm = (
-            previous_cm + dm
-            if trend == previous_trend
-            else previous_dm + dm
-        )
-        vf = (
-            candle["v"] * abs(2 * ((dm / cm) - 1)) * trend * 100
-            if cm
-            else 0.0
-        )
-        volume_force.append(vf)
-        previous_trend = trend
-        previous_dm = dm
-        previous_cm = cm
-        previous_hlc = hlc
-
-    fast_ema = ema(volume_force, FAST)
-    slow_ema = ema(volume_force, SLOW)
-    kvo = [None] * len(candles)
-    for i in range(len(candles)):
-        if fast_ema[i] is not None and slow_ema[i] is not None:
-            kvo[i] = fast_ema[i] - slow_ema[i]
-
-    first = next((i for i, value in enumerate(kvo) if value is not None), None)
-    if first is None:
-        return None
-
-    signal_compact = ema([value for value in kvo[first:] if value is not None], SIG)
-    signal = [None] * len(candles)
-    for offset, value in enumerate(signal_compact):
-        signal[first + offset] = value
-    return kvo, signal
+    buy_separation = kvo[current] - signal[current]
+    sell_separation = signal[current] - kvo[current]
+    buy_positive = not USE_MODERATE_CROSS or MIN_POST_CROSS <= buy_separation <= MAX_POST_CROSS
+    sell_positive = not USE_MODERATE_CROSS or MIN_POST_CROSS <= sell_separation <= MAX_POST_CROSS
+    buy = buy_cross and candle["c"] > candle["o"] and buy_mode and buy_positive
+    sell = sell_cross and candle["c"] < candle["o"] and sell_mode and sell_positive
+    return {
+        "signal_type": "COMPRA" if buy else "VENDA" if sell else None,
+        "kvo": kvo[current],
+        "signal": signal[current],
+        "body_percent": body_percent,
+        "separation": buy_separation if buy else sell_separation if sell else abs(kvo[current] - signal[current]),
+    }
 
 
 def candle_color(candle):
@@ -190,10 +219,13 @@ async def seed():
 
 
 async def monitor():
-    """Monitora BTCUSDT continuamente enquanto a instância do Render estiver ativa."""
+    """Replica o Pine V4 nos updates da vela Binance BTCUSDT de 1 minuto."""
     global bars
     pending = None
     last_processed_bar = None
+    active_bar = None
+    latched_signal = None
+    alerted_bar = None
     state["running"] = True
 
     while state["running"]:
@@ -220,89 +252,73 @@ async def monitor():
                         "v": float(kline["v"]),
                     }
                     state["price"] = candle["c"]
+                    if active_bar != candle["t"]:
+                        active_bar = candle["t"]
+                        latched_signal = None
 
-                    # A regra só é avaliada no fechamento da vela de 1 minuto.
-                    if not bool(kline["x"]):
-                        continue
-                    if candle["t"] == last_processed_bar:
+                    closes_at = int(kline["T"])
+                    seconds_remaining = max(0.0, (closes_at - int(time.time() * 1000)) / 1000.0)
+                    time_window = bool(kline["x"]) or seconds_remaining <= SECONDS_BEFORE_CLOSE
+                    evaluation = evaluate_v4(bars + [candle])
+                    if evaluation:
+                        state["kvo"] = evaluation["kvo"]
+                        state["signal"] = evaluation["signal"]
+
+                    # Pine trava o sinal ate o inicio da proxima vela.
+                    if time_window and evaluation and evaluation["signal_type"]:
+                        latched_signal = latched_signal or evaluation["signal_type"]
+
+                    if latched_signal and alerted_bar != candle["t"]:
+                        alerted_bar = candle["t"]
+                        event = {
+                            "type": latched_signal,
+                            "time": int(time.time()),
+                            "price": candle["c"],
+                            "bar": candle["t"],
+                            "seconds_remaining": round(seconds_remaining, 1),
+                            "kvo": evaluation["kvo"],
+                            "signal": evaluation["signal"],
+                            "body_percent": evaluation["body_percent"],
+                            "separation": evaluation["separation"],
+                        }
+                        pending = {"type": latched_signal, "bar": candle["t"]}
+                        state["last_signal"] = event
+                        state["pending"] = pending
+                        icon = "🟢" if latched_signal == "COMPRA" else "🔴"
+                        await telegram_safe(
+                            f"{icon} Klinger V4 — {latched_signal}\n"
+                            f"BTCUSDT 1m | Preço: {candle['c']:.2f}\n"
+                            f"Sinal detectado nos {SECONDS_BEFORE_CLOSE}s finais da vela."
+                        )
+
+                    if not bool(kline["x"]) or candle["t"] == last_processed_bar:
                         continue
 
                     last_processed_bar = candle["t"]
-                    if bars and bars[-1]["t"] == candle["t"]:
-                        bars[-1] = candle
-                    else:
-                        bars.append(candle)
-                        bars = bars[-1000:]
-
+                    bars.append(candle)
+                    bars = bars[-1000:]
                     state["last_closed_bar"] = candle["t"]
-                    calculated = klinger_full(bars)
-                    if not calculated:
-                        continue
 
-                    kvo, signal = calculated
-                    current = len(bars) - 1
-                    previous = current - 1
-                    state["kvo"] = kvo[current]
-                    state["signal"] = signal[current]
-
-                    # A vela imediatamente posterior confirma ou cancela o sinal.
+                    # A vela seguinte classifica LUCRO/LOS, como no Pine.
                     if pending and candle["t"] > pending["bar"]:
                         color = candle_color(candle)
-                        confirmed = (
+                        profit = (
                             pending["type"] == "COMPRA" and color == "green"
                         ) or (
                             pending["type"] == "VENDA" and color == "red"
                         )
-                        if confirmed:
-                            event = {
-                                "type": pending["type"],
-                                "time": int(time.time()),
-                                "price": candle["c"],
-                                "cross_bar": pending["bar"],
-                                "confirmation_bar": candle["t"],
-                            }
-                            state["last_signal"] = event
-                            icon = "🟢" if pending["type"] == "COMPRA" else "🔴"
-                            await telegram_safe(
-                                f"{icon} {pending['type']} CONFIRMADA — BTCUSDT 1m\n"
-                                f"Preço no fechamento: {candle['c']:.2f}\n"
-                                "Regra: cruzamento do Klinger + próxima vela da mesma cor."
-                            )
+                        loss = color != "doji" and not profit
+                        if profit:
+                            state["profit_count"] += 1
+                        elif loss:
+                            state["loss_count"] += 1
+                        state["total_count"] = state["profit_count"] + state["loss_count"]
+                        state["accuracy"] = (
+                            state["profit_count"] * 100.0 / state["total_count"]
+                            if state["total_count"] else 0.0
+                        )
                         pending = None
                         state["pending"] = None
-
-                    if all(
-                        value is not None
-                        for value in (
-                            kvo[previous],
-                            signal[previous],
-                            kvo[current],
-                            signal[current],
-                        )
-                    ):
-                        crossed_up = (
-                            kvo[previous] <= signal[previous]
-                            and kvo[current] > signal[current]
-                        )
-                        crossed_down = (
-                            kvo[previous] >= signal[previous]
-                            and kvo[current] < signal[current]
-                        )
-                        color = candle_color(candle)
-                        signal_type = (
-                            "COMPRA"
-                            if crossed_up and color == "green"
-                            else "VENDA"
-                            if crossed_down and color == "red"
-                            else None
-                        )
-                        if signal_type:
-                            pending = {
-                                "type": signal_type,
-                                "bar": candle["t"],
-                                "color": color,
-                            }
-                            state["pending"] = pending
 
         except asyncio.CancelledError:
             raise
