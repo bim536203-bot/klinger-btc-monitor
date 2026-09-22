@@ -891,6 +891,13 @@ async def startup_event():
     ensure_monitor()
     asyncio.create_task(telegram_diagnostics())
     asyncio.create_task(trading_diagnostics())
+    asyncio.create_task(
+        telegram_safe(
+            "🔔 <b>TESTE DE SOM — KLINGER V4</b>\n\n"
+            "Este é apenas um teste da nova notificação de 4 segundos.\n"
+            "⚠️ Nenhum sinal e nenhuma ordem foram enviados."
+        )
+    )
 
 
 @app.get("/")
