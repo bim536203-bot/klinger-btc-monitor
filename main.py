@@ -894,7 +894,7 @@ async def startup_event():
     asyncio.create_task(
         telegram_safe(
             "🔔 <b>TESTE DE SOM — KLINGER V4</b>\n\n"
-            "Este é apenas um teste da nova notificação de 4 segundos.\n"
+            "Este é o teste solicitado agora da nova notificação de 4 segundos.\n"
             "⚠️ Nenhum sinal e nenhuma ordem foram enviados."
         )
     )
