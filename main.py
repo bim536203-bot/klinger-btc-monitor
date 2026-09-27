@@ -5,7 +5,9 @@ import json
 import math
 import os
 import time
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
 import websockets
@@ -31,7 +33,9 @@ EXHAUSTION_BODY_MAX = 99.9
 MAX_KVO_STRETCH = 51.7
 USE_MODERATE_CROSS = True
 MIN_POST_CROSS = 10.0
-MAX_POST_CROSS = 14.0
+MAX_POST_CROSS = 30.0
+MAX_CONFIRMATION_BODY = 70.0
+LOCAL_TZ = ZoneInfo("America/Manaus")
 REST_URL = "https://data-api.binance.vision/api/v3/klines"
 WS_URL = "wss://data-stream.binance.vision/ws/btcusdt@kline_1m"
 # Endpoint oficial do USD-M Futures Testnet. O host demo-fapi pode bloquear
@@ -63,6 +67,9 @@ state = {
     "loss_count": 0,
     "total_count": 0,
     "accuracy": 0.0,
+    "session_day": None,
+    "previous_day": None,
+    "previous_day_stats": None,
     "trading_environment": "binance_futures_testnet",
     "trading_enabled": False,
     "trading_status": "disabled",
@@ -219,6 +226,13 @@ async def dashboard_snapshot():
                 "kvo": state["kvo"],
                 "signal_line": state["signal"],
                 "last_signal": state["last_signal"],
+                "session_day": state["session_day"],
+                "profit_count": state["profit_count"],
+                "loss_count": state["loss_count"],
+                "total_count": state["total_count"],
+                "accuracy": round(state["accuracy"], 1),
+                "previous_day": state["previous_day"],
+                "previous_day_stats": state["previous_day_stats"],
                 "consecutive_losses": state["consecutive_losses"],
                 "max_consecutive_losses": state["max_consecutive_losses"],
                 "leverage": state["trade_leverage"],
@@ -583,6 +597,33 @@ def candle_color(candle):
     return "doji"
 
 
+def session_day(timestamp_ms):
+    """Data de Manaus somente para sinais cuja vela abre entre 06h e 20h."""
+    local = datetime.fromtimestamp(timestamp_ms / 1000, LOCAL_TZ)
+    return local.date().isoformat() if 6 <= local.hour < 20 else None
+
+
+def roll_session(day):
+    """Troca o placar na primeira vela elegivel do novo dia."""
+    if day is None or state["session_day"] == day:
+        return
+    if state["session_day"] is not None:
+        state["previous_day"] = state["session_day"]
+        state["previous_day_stats"] = {
+            "profit_count": state["profit_count"],
+            "loss_count": state["loss_count"],
+            "total_count": state["total_count"],
+            "accuracy": state["accuracy"],
+        }
+    state["session_day"] = day
+    state["profit_count"] = 0
+    state["loss_count"] = 0
+    state["total_count"] = 0
+    state["accuracy"] = 0.0
+    state["signal_history"] = []
+    state["last_signal"] = None
+
+
 async def telegram(text):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
@@ -637,12 +678,21 @@ async def telegram_diagnostics():
 async def seed():
     global bars
     now_ms = int(time.time() * 1000)
+    cursor = now_ms
+    rows = []
     async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(
-            REST_URL,
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 1000},
-        )
-        response.raise_for_status()
+        # Quatro blocos incluem o dia anterior e aquecimento das medias.
+        for _ in range(4):
+            response = await client.get(
+                REST_URL,
+                params={"symbol": "BTCUSDT", "interval": "1m", "limit": 1000, "endTime": cursor},
+            )
+            response.raise_for_status()
+            page = response.json()
+            if not page:
+                break
+            rows = page + rows
+            cursor = int(page[0][0]) - 1
 
     # A Binance inclui a vela atual no REST. Mantemos apenas velas já fechadas.
     bars = [
@@ -654,19 +704,82 @@ async def seed():
             "c": float(row[4]),
             "v": float(row[5]),
         }
-        for row in response.json()
+        for row in rows
         if int(row[6]) < now_ms
     ]
+    rebuild_daily_history(bars)
+    bars = bars[-1000:]
+
+
+def rebuild_daily_history(candles):
+    """Reconstitui os placares após reinício, sem reenviar alertas antigos."""
+    sessions = {}
+    events = {}
+    pending_event = None
+    for i in range(2, len(candles)):
+        candle = candles[i]
+        day = session_day(candle["t"])
+        if not day:
+            continue
+        cross = evaluate_v4(candles[max(0, i - 1000):i])
+        direction = cross["signal_type"] if cross else None
+        body = abs(candle["c"] - candle["o"]) / max(candle["h"] - candle["l"], 1e-12) * 100.0
+        color = candle_color(candle)
+        if body > MAX_CONFIRMATION_BODY or not (
+            (direction == "COMPRA" and color == "green")
+            or (direction == "VENDA" and color == "red")
+        ):
+            continue
+        next_candle = candles[i + 1] if i + 1 < len(candles) else None
+        next_color = candle_color(next_candle) if next_candle else None
+        result = "PENDENTE" if next_color is None else (
+            "DOJI" if next_color == "doji" else
+            "LUCRO" if next_color == color else "LOS"
+        )
+        stats = sessions.setdefault(day, {"profit_count": 0, "loss_count": 0})
+        if result == "LUCRO":
+            stats["profit_count"] += 1
+        elif result == "LOS":
+            stats["loss_count"] += 1
+        event = {
+            "id": f"{candle['t']}-{direction}", "type": direction,
+            "time": (candle["t"] + 60000) // 1000,
+            "price": candle["c"], "bar": candle["t"],
+            "result": result, "result_price": next_candle["c"] if next_candle else None,
+        }
+        events.setdefault(day, []).append(event)
+        if not next_candle:
+            pending_event = event
+
+    def summarize(day):
+        stats = sessions.get(day, {"profit_count": 0, "loss_count": 0})
+        total = stats["profit_count"] + stats["loss_count"]
+        return {**stats, "total_count": total,
+                "accuracy": stats["profit_count"] * 100.0 / total if total else 0.0}
+
+    today = datetime.now(LOCAL_TZ).date().isoformat()
+    visible = today if datetime.now(LOCAL_TZ).hour >= 6 else (
+        datetime.now(LOCAL_TZ).date() - timedelta(days=1)
+    ).isoformat()
+    eligible = sorted(day for day in sessions if day <= visible)
+    active = visible if today == visible and datetime.now(LOCAL_TZ).hour >= 6 else (eligible[-1] if eligible else None)
+    previous = (datetime.fromisoformat(active).date() - timedelta(days=1)).isoformat() if active else None
+    state["session_day"] = active
+    if active:
+        state.update(summarize(active))
+        state["signal_history"] = list(reversed(events.get(active, [])))[:200]
+        state["last_signal"] = state["signal_history"][0] if state["signal_history"] else None
+        state["pending"] = ({"type": pending_event["type"], "bar": pending_event["bar"],
+                              "event_id": pending_event["id"]}
+                            if pending_event and pending_event in events.get(active, []) else None)
+    state["previous_day"] = previous
+    state["previous_day_stats"] = summarize(previous) if previous else None
 
 
 async def monitor():
-    """Replica o Pine V4 nos updates da vela Binance BTCUSDT de 1 minuto."""
+    """Emite apenas no fechamento da confirmacao, como no Pine."""
     global bars
-    pending = None
     last_processed_bar = None
-    active_bar = None
-    latched_signal = None
-    alerted_bar = None
     state["running"] = True
 
     while state["running"]:
@@ -693,60 +806,10 @@ async def monitor():
                         "v": float(kline["v"]),
                     }
                     state["price"] = candle["c"]
-                    if active_bar != candle["t"]:
-                        active_bar = candle["t"]
-                        latched_signal = None
-
-                    closes_at = int(kline["T"])
-                    seconds_remaining = max(0.0, (closes_at - int(time.time() * 1000)) / 1000.0)
-                    time_window = bool(kline["x"]) or seconds_remaining <= SECONDS_BEFORE_CLOSE
                     evaluation = evaluate_v4(bars + [candle])
                     if evaluation:
                         state["kvo"] = evaluation["kvo"]
                         state["signal"] = evaluation["signal"]
-
-                    # Pine trava o sinal ate o inicio da proxima vela.
-                    if time_window and evaluation and evaluation["signal_type"]:
-                        latched_signal = latched_signal or evaluation["signal_type"]
-
-                    if latched_signal and alerted_bar != candle["t"]:
-                        alerted_bar = candle["t"]
-                        event_id = f"{candle['t']}-{latched_signal}"
-                        event = {
-                            "id": event_id,
-                            "type": latched_signal,
-                            "time": int(time.time()),
-                            "price": candle["c"],
-                            "bar": candle["t"],
-                            "seconds_remaining": round(seconds_remaining, 1),
-                            "kvo": evaluation["kvo"],
-                            "signal": evaluation["signal"],
-                            "body_percent": evaluation["body_percent"],
-                            "separation": evaluation["separation"],
-                            "result": "PENDENTE",
-                            "result_time": None,
-                            "result_price": None,
-                        }
-                        pending = {
-                            "type": latched_signal,
-                            "bar": candle["t"],
-                            "event_id": event_id,
-                        }
-                        state["last_signal"] = event
-                        state["pending"] = pending
-                        state["signal_history"].insert(0, event.copy())
-                        del state["signal_history"][200:]
-                        icon = "🟢" if latched_signal == "COMPRA" else "🔴"
-                        await telegram_safe(
-                            f"🚨🚨 <b>ALERTA DE OPERAÇÃO — {latched_signal}</b> 🚨🚨\n\n"
-                            f"{icon} <b>BTCUSDT • 1 minuto</b>\n"
-                            f"💰 Preço: <b>{candle['c']:.2f}</b>\n"
-                            f"⏱️ Sinal confirmado nos {SECONDS_BEFORE_CLOSE}s finais da vela.\n\n"
-                            f"👉 <b>Confira o gráfico agora.</b>\n"
-                            f"⚠️ Operação manual: nenhuma ordem foi enviada."
-                        )
-                        # Modo somente alerta: nenhuma ordem, inclusive Demo/Testnet,
-                        # e enviada automaticamente quando surge um sinal.
 
                     if not bool(kline["x"]) or candle["t"] == last_processed_bar:
                         continue
@@ -755,6 +818,8 @@ async def monitor():
                     bars.append(candle)
                     bars = bars[-1000:]
                     state["last_closed_bar"] = candle["t"]
+                    day = session_day(candle["t"])
+                    roll_session(day)
 
                     # Tenta fechar novamente em fechamentos posteriores caso a
                     # primeira tentativa falhe por um erro temporario da API.
@@ -773,6 +838,7 @@ async def monitor():
                             )
 
                     # A vela seguinte classifica LUCRO/LOS, como no Pine.
+                    pending = state["pending"]
                     if pending and candle["t"] > pending["bar"]:
                         color = candle_color(candle)
                         profit = (
@@ -781,9 +847,9 @@ async def monitor():
                             pending["type"] == "VENDA" and color == "red"
                         )
                         loss = color != "doji" and not profit
-                        if profit:
+                        if profit and pending.get("session_day"):
                             state["profit_count"] += 1
-                        elif loss:
+                        elif loss and pending.get("session_day"):
                             state["loss_count"] += 1
                         state["total_count"] = state["profit_count"] + state["loss_count"]
                         state["accuracy"] = (
@@ -799,8 +865,50 @@ async def monitor():
                                 saved_event["result_time"] = int(time.time())
                                 saved_event["result_price"] = candle["c"]
                                 break
-                        pending = None
                         state["pending"] = None
+
+                    # Avalia o cruzamento na vela ANTERIOR ja fechada e a
+                    # confirmacao nesta vela fechada. Nunca antecipa o alerta.
+                    cross = evaluate_v4(bars[:-1])
+                    cross_type = cross["signal_type"] if cross else None
+                    body = abs(candle["c"] - candle["o"]) / max(candle["h"] - candle["l"], 1e-12) * 100.0
+                    color = candle_color(candle)
+                    confirmed = body <= MAX_CONFIRMATION_BODY and (
+                        (cross_type == "COMPRA" and color == "green")
+                        or (cross_type == "VENDA" and color == "red")
+                    )
+                    if confirmed:
+                        event_id = f"{candle['t']}-{cross_type}"
+                        event = {
+                            "id": event_id,
+                            "type": cross_type,
+                            "time": int(time.time()),
+                            "price": candle["c"],
+                            "bar": candle["t"],
+                            "seconds_remaining": 0.0,
+                            "kvo": evaluation["kvo"] if evaluation else None,
+                            "signal": evaluation["signal"] if evaluation else None,
+                            "body_percent": body,
+                            "separation": cross["separation"],
+                            "result": "PENDENTE",
+                            "result_time": None,
+                            "result_price": None,
+                        }
+                        state["last_signal"] = event
+                        state["pending"] = {"type": cross_type, "bar": candle["t"], "event_id": event_id,
+                                            "session_day": day}
+                        if day:
+                            state["signal_history"].insert(0, event.copy())
+                            del state["signal_history"][200:]
+                        icon = "🟢" if cross_type == "COMPRA" else "🔴"
+                        await telegram_safe(
+                            f"🚨🚨 <b>ALERTA DE OPERAÇÃO — {cross_type}</b> 🚨🚨\n\n"
+                            f"{icon} <b>BTCUSDT • 1 minuto</b>\n"
+                            f"💰 Preço: <b>{candle['c']:.2f}</b>\n"
+                            f"⏱️ Sinal confirmado no fechamento da vela.\n\n"
+                            f"👉 <b>Confira o gráfico agora.</b>\n"
+                            f"⚠️ Operação manual: nenhuma ordem foi enviada."
+                        )
 
         except asyncio.CancelledError:
             raise
@@ -847,6 +955,12 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">PnL realizado</div><div class="value" id="netPnl">—</div></div>
     <div class="card"><div class="label">PnL posição aberta</div><div class="value" id="openPnl">—</div></div>
   </section>
+  <section class="card section"><h2 class="section-title">Acerto do dia • 06h às 20h (Manaus)</h2><div class="grid">
+    <div><div class="label">Data</div><div class="value small" id="dayDate">—</div></div>
+    <div><div class="label">LUCRO</div><div class="value small green" id="dayProfit">0</div></div>
+    <div><div class="label">LOS</div><div class="value small red" id="dayLoss">0</div></div>
+    <div><div class="label">Acerto</div><div class="value small" id="dayAccuracy">0,0%</div></div>
+  </div><div class="label" id="previousDay" style="margin-top:12px">Dia anterior: —</div></section>
   <section class="card section"><h2 class="section-title">Resultados executados</h2><div class="grid">
     <div><div class="label">Operações</div><div class="value small" id="operations">0</div></div>
     <div><div class="label">LUCRO</div><div class="value small green" id="profits">0</div></div>
@@ -874,6 +988,7 @@ const num=(v,d=2)=>v==null?'—':Number(v).toLocaleString('pt-BR',{minimumFracti
 const color=(node,value)=>{node.classList.remove('green','red');if(Number(value)>0)node.classList.add('green');if(Number(value)<0)node.classList.add('red')};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function render(d){el('connection').textContent=d.connected?'AO VIVO':'SEM CONEXÃO';el('error').style.display=d.error?'block':'none';el('error').textContent=d.error||'';
+ const day=d.bot;el('dayDate').textContent=day.session_day||'Aguardando 06h';el('dayProfit').textContent=day.profit_count;el('dayLoss').textContent=day.loss_count;el('dayAccuracy').textContent=num(day.accuracy,1)+'%';const old=day.previous_day_stats;el('previousDay').textContent=old?'Dia anterior ('+day.previous_day+'): '+old.profit_count+' LUCRO / '+old.loss_count+' LOS • '+num(old.accuracy,1)+'%':'Dia anterior: —';
  const b=d.balance||{};el('wallet').textContent=money(b.wallet_usdt,2);el('available').textContent=money(b.available_usdt,2);el('openPnl').textContent=money(b.unrealized_pnl_usdt,4);color(el('openPnl'),b.unrealized_pnl_usdt);
  el('netPnl').textContent=money(d.summary.net_pnl_usdt,4);color(el('netPnl'),d.summary.net_pnl_usdt);el('operations').textContent=d.summary.operations;el('profits').textContent=d.summary.profits;el('losses').textContent=d.summary.losses;el('accuracy').textContent=num(d.summary.accuracy,1)+'%';
  const bot=d.bot;el('monitor').innerHTML=bot.monitor_running?'<span class="pill ok">ATIVO</span>':'<span class="pill bad">PARADO</span>';el('executor').innerHTML=bot.trading_enabled?'<span class="pill ok">'+esc(bot.trading_status)+'</span>':'<span class="pill off">'+esc(bot.trading_status)+'</span>';el('telegram').textContent=bot.telegram_status;el('price').textContent=bot.price?num(bot.price,2)+' USDT':'—';el('lastSignal').textContent=bot.last_signal?bot.last_signal.type+' • '+num(bot.last_signal.price,2):'Nenhum';el('kvo').textContent=(bot.kvo==null?'—':num(bot.kvo,2))+' / '+(bot.signal_line==null?'—':num(bot.signal_line,2));el('streak').textContent=bot.consecutive_losses+' / '+bot.max_consecutive_losses;el('config').textContent=bot.leverage+'x • ~'+num(bot.estimated_margin_usdt,2)+' USDT';
@@ -890,7 +1005,9 @@ async def startup_event():
     # Inicia automaticamente após cada deploy ou despertar da instância.
     ensure_monitor()
     asyncio.create_task(telegram_diagnostics())
-    asyncio.create_task(trading_diagnostics())
+    # Apenas monitoramento manual: nao habilitar o executor de ordens.
+    state["trading_enabled"] = False
+    state["trading_status"] = "disabled"
 
 
 @app.get("/")
